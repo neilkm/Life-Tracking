@@ -3,5 +3,5 @@ data/*.toml
 data/*.txt
 
 #rust
-target/*
+target
 Cargo*
