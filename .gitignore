@@ -1,5 +1,6 @@
 #user data
-data/*
+data/*.toml
+data/*.txt
 
 #rust
 target/*
