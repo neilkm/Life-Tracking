@@ -1,0 +1,6 @@
+#user data
+data/*
+
+#rust
+target/*
+Cargo*

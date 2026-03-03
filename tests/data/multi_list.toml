@@ -1,0 +1,19 @@
+name = "Alpha"
+priority = 2
+color_hex = "#118855"
+
+[[tasks]]
+title = "Later by priority"
+description = "Same day, lower priority order"
+due_date = "2026-03-10"
+estimated_hours = 90
+actual_hours = 10
+completed = false
+
+[[tasks]]
+title = "High time left"
+description = "For time-left sorting"
+due_date = "2026-03-11"
+estimated_hours = 100
+actual_hours = 10
+completed = false

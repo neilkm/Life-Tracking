@@ -1,0 +1,20 @@
+name = "Archive"
+priority = 3
+color_hex = "#888888"
+
+[[tasks]]
+title = "Old completed"
+description = "Should be pruned on load"
+due_date = "2024-01-01"
+estimated_hours = 60
+actual_hours = 60
+completed = true
+completed_on = "2024-01-02"
+
+[[tasks]]
+title = "Keep this"
+description = "Incomplete task should remain"
+due_date = "2026-12-01"
+estimated_hours = 10
+actual_hours = 0
+completed = false

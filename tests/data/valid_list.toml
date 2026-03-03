@@ -1,0 +1,11 @@
+name = "Work"
+priority = 1
+color_hex = "#3399FF"
+
+[[tasks]]
+title = "Draft roadmap"
+description = "Collect milestones for Q2"
+due_date = "2026-03-03"
+estimated_hours = 120
+actual_hours = 30
+completed = false
