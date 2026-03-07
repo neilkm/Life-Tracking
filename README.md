@@ -9,12 +9,25 @@ Terminal task manager with multiple task lists, priorities, due dates, time trac
 
 ## Quick Start
 
-1. Build the project:
+1. Install the app:
+```bash
+cargo install --path .
+```
+2. Run it from anywhere:
+```bash
+life-tracking
+```
+
+Installed executable location:
+
+- Cargo installs the binary into Cargo's bin directory.
+- Typical path on macOS/Linux: `~/.cargo/bin/life-tracking`
+- Typical path on Windows: `%USERPROFILE%\.cargo\bin\life-tracking.exe`
+
+For local development:
+
 ```bash
 cargo build
-```
-2. Run the app:
-```bash
 ./scripts/run-app.sh
 ```
 
@@ -62,7 +75,7 @@ In due-date mode, tasks are grouped by due-date headers (earliest to latest).
 The right-side column shows:
 
 - `Task Lists`: names colored by list color, ranked by priority
-- `Notes`: text loaded from `data/notes.txt`
+- `Notes`: text loaded from `notes.txt` in the active data directory
 
 ## Task Expanded View
 
@@ -139,10 +152,22 @@ Delete confirmations:
 
 ## Data Storage
 
-Task data is stored in the `data/` directory.
+By default, task data is stored in your OS app-data directory.
 
-- One TOML file per list: `data/list_<id>.toml`
-- Notes file: `data/notes.txt`
+- macOS: `~/Library/Application Support/life-tracking`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/life-tracking`
+- Windows: `%LOCALAPPDATA%\life-tracking`
+
+Set `LIFE_TRACKING_DATA_DIR` to override that location.
+
+Installed data location:
+
+- macOS: `~/Library/Application Support/life-tracking`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/life-tracking`
+- Windows: `%LOCALAPPDATA%\life-tracking`
+
+- One TOML file per list: `list_<id>.toml`
+- Notes file: `notes.txt`
 - Task-list-level fields at top: `name`, `priority`, `color_hex`
 - Tasks stored under `[[tasks]]`
 
@@ -165,7 +190,7 @@ completed_on = "2026-03-03"
 
 ## Persistence Behavior
 
-- Any edit in the app is saved immediately to `data/`.
+- Any edit in the app is saved immediately to the active data directory.
 - On startup, config files are loaded and validated.
 - If any config file has invalid format/content, a startup popup shows the issue.
 - When a task is marked complete, `completed_on` is recorded.
@@ -173,5 +198,6 @@ completed_on = "2026-03-03"
 
 ## Scripts
 
+- `scripts/install-app.sh`: builds and installs the app with `cargo install --path . --force`
 - `scripts/run-app.sh`: runs `cargo run`
 - `scripts/run-tests.sh`: runs `cargo test`

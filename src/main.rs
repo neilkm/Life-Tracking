@@ -2253,20 +2253,11 @@ fn resolve_data_dir() -> PathBuf {
         }
     }
 
-    let Ok(mut dir) = env::current_dir() else {
-        return PathBuf::from("data");
-    };
-
-    loop {
-        if dir.join("Cargo.toml").is_file() {
-            return dir.join("data");
-        }
-        if !dir.pop() {
-            break;
-        }
+    if let Some(base_dir) = dirs::data_local_dir().or_else(dirs::data_dir) {
+        return base_dir.join("life-tracking");
     }
 
-    PathBuf::from("data")
+    PathBuf::from(".life-tracking")
 }
 
 fn load_notes_text(path: &Path) -> String {
