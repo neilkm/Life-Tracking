@@ -1,22 +1,30 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDate;
+use chrono::{Local, NaiveDate};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear as TermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use life_tracking::{AppData, ListSortMode, TaskKey, TaskSortMode, parse_hex_color};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::block::Title;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+
+const VIM_HELP_START: &str = "# ----- life-tracking help -----";
+const VIM_HELP_END: &str = "# ----- end life-tracking help -----";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -53,9 +61,10 @@ struct EditorState {
     cursor_index: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ConfirmAction {
     DeleteTask(TaskKey),
+    DeleteTasks(Vec<TaskKey>),
     DeleteList(u64),
 }
 
@@ -64,25 +73,19 @@ struct ConfirmState {
     action: ConfirmAction,
 }
 
-#[derive(Clone, Copy)]
-enum TextEditorTarget {
-    Notes,
-    TaskDescription(TaskKey),
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TextEditorMode {
-    Normal,
-    Insert,
+enum MultiTaskEditMode {
+    Menu,
+    DueDate,
+    ListName,
 }
 
-struct TextEditorState {
-    target: TextEditorTarget,
-    content: String,
+struct MultiTaskEditState {
+    keys: Vec<TaskKey>,
+    mode: MultiTaskEditMode,
+    input: String,
     cursor_index: usize,
-    mode: TextEditorMode,
-    command_active: bool,
-    command: String,
+    suggestion_index: usize,
 }
 
 struct App {
@@ -107,16 +110,19 @@ struct App {
     selected_main_idx: usize,
     selected_list_idx: usize,
     selected_list_task_idx: usize,
+    task_selection_anchor: Option<usize>,
+    multi_selected_tasks: HashSet<TaskKey>,
 
     expanded_list_id: Option<u64>,
     expanded_task_key: Option<TaskKey>,
     editor: Option<EditorState>,
-    text_editor: Option<TextEditorState>,
+    multi_task_edit: Option<MultiTaskEditState>,
     confirm: Option<ConfirmState>,
 
     popup_messages: Vec<String>,
     show_popup: bool,
     cursor_blink_start: Instant,
+    pending_full_redraw: bool,
     notes_text: String,
 }
 
@@ -141,14 +147,17 @@ impl App {
             selected_main_idx: 0,
             selected_list_idx: 0,
             selected_list_task_idx: 0,
+            task_selection_anchor: None,
+            multi_selected_tasks: HashSet::new(),
             expanded_list_id: None,
             expanded_task_key: None,
             editor: None,
-            text_editor: None,
+            multi_task_edit: None,
             confirm: None,
             popup_messages: startup_messages,
             show_popup,
             cursor_blink_start: Instant::now(),
+            pending_full_redraw: false,
             notes_text,
         }
     }
@@ -179,6 +188,11 @@ impl App {
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     ) -> io::Result<()> {
         while self.running {
+            if self.pending_full_redraw {
+                terminal.clear()?;
+                self.pending_full_redraw = false;
+            }
+
             terminal.draw(|frame| self.draw(frame))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -194,10 +208,20 @@ impl App {
     fn draw(&self, frame: &mut Frame) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ])
             .split(frame.area());
 
-        self.draw_controls(frame, layout[0]);
+        let top_bar = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(82), Constraint::Percentage(18)])
+            .split(layout[0]);
+
+        self.draw_search_bar(frame, top_bar[0]);
+        self.draw_now_panel(frame, top_bar[1]);
 
         match self.page {
             Page::Main => self.draw_main_page(frame, layout[1]),
@@ -212,10 +236,6 @@ impl App {
             self.draw_task_expanded(frame, task_key);
         }
 
-        if self.text_editor.is_some() {
-            self.draw_text_editor(frame);
-        }
-
         if self.show_popup {
             self.draw_popup(frame);
         }
@@ -223,6 +243,12 @@ impl App {
         if self.confirm.is_some() {
             self.draw_confirm(frame);
         }
+
+        if self.multi_task_edit.is_some() {
+            self.draw_multi_task_edit(frame);
+        }
+
+        self.draw_controls(frame, layout[2]);
     }
 
     fn draw_controls(&self, frame: &mut Frame, area: Rect) {
@@ -250,63 +276,132 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
+    fn draw_now_panel(&self, frame: &mut Frame, area: Rect) {
+        let now = Local::now();
+        let now_style = Style::default()
+            .fg(current_accent_color())
+            .add_modifier(Modifier::BOLD);
+        let paragraph = Paragraph::new(vec![
+            Line::from(Span::styled(
+                now.format("%a %Y-%m-%d").to_string(),
+                now_style,
+            )),
+            Line::from(Span::styled(
+                now.format("%I:%M:%S %p").to_string(),
+                now_style,
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(paragraph, area);
+    }
+
+    fn draw_search_bar(&self, frame: &mut Frame, area: Rect) {
+        let (line, active, cursor_index, title) = match self.page {
+            Page::Main => {
+                let line = if self.search.is_empty() {
+                    Line::from("")
+                } else {
+                    Line::from(Span::raw(self.search.clone()))
+                };
+                let title = if self.search_active {
+                    "Search -- [enter] apply search, [esc] clear"
+                } else if self.search.is_empty() {
+                    "Search -- [/] start search"
+                } else {
+                    "Search -- [/] edit search, [esc] clear search"
+                };
+                (line, self.search_active, self.search_cursor_index, title)
+            }
+            Page::TaskLists => {
+                let line = if self.list_search.is_empty() {
+                    Line::from("")
+                } else {
+                    Line::from(Span::raw(self.list_search.clone()))
+                };
+                let title = if self.list_search_active {
+                    "Search -- [enter] apply search, [esc] clear"
+                } else if self.list_search.is_empty() {
+                    "Search -- [/] start search"
+                } else {
+                    "Search -- [/] edit search, [esc] clear search"
+                };
+                (
+                    line,
+                    self.list_search_active,
+                    self.list_search_cursor_index,
+                    title,
+                )
+            }
+        };
+
+        frame.render_widget(
+            Paragraph::new(vec![line]).block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
+
+        if active && self.cursor_visible() {
+            let value = match self.page {
+                Page::Main => &self.search,
+                Page::TaskLists => &self.list_search,
+            };
+            let cursor = self.cursor_position_for_input(area, value, cursor_index);
+            frame.set_cursor_position(cursor);
+        }
+    }
+
     fn controls_text(&self) -> (&'static str, String) {
-        if let Some(editor) = &self.text_editor {
-            if editor.command_active {
-                return (
-                    "EDIT",
-                    ":w save, :wq save+quit, :q quit, esc cancel".to_string(),
-                );
-            }
-            if editor.mode == TextEditorMode::Insert {
-                return (
-                    "EDIT",
-                    "insert mode: type, enter newline, esc normal, ctrl+s save".to_string(),
-                );
-            }
-            return (
-                "EDIT",
-                "normal mode: i insert, h/j/k/l move, x delete, : command".to_string(),
-            );
+        if let Some(state) = &self.multi_task_edit {
+            return match state.mode {
+                MultiTaskEditMode::Menu => (
+                    "MULTI",
+                    "[r] due date, [l] move to list, [d] delete selected, [esc] cancel"
+                        .to_string(),
+                ),
+                MultiTaskEditMode::DueDate => (
+                    "MULTI",
+                    "type YYYY-MM-DD, [enter] save, [esc] cancel".to_string(),
+                ),
+                MultiTaskEditMode::ListName => (
+                    "MULTI",
+                    "type filter, [↑/↓] choose, [enter] save, [esc] cancel".to_string(),
+                ),
+            };
         }
 
         if self.confirm.is_some() {
-            return ("CONFIRM", "enter/y yes, esc/n no".to_string());
+            return ("CONFIRM", "[enter/y] yes, [esc/n] no".to_string());
         }
 
         if self.show_popup {
-            return ("POPUP", "enter/esc close".to_string());
+            return ("POPUP", "[enter/esc] close".to_string());
         }
 
         if let Some(editor) = &self.editor {
             if matches!(editor.target, EditTarget::Task(_, TaskField::ListName)) {
                 return (
                     "EDIT",
-                    "type filter, up/down choose, enter save, esc cancel".to_string(),
+                    "type filter, [↑/↓] choose, [enter] save, [esc] cancel".to_string(),
                 );
             }
 
-            return ("EDIT", "type value, enter save, esc cancel".to_string());
+            return ("EDIT", "type value, [enter] save, [esc] cancel".to_string());
         }
 
         if self.expanded_task_key.is_some() {
-            return (
-                "TASK",
-                "esc back, t title, d desc, e est, w actual, r due, a done, l move list, del delete"
-                    .to_string(),
-            );
+            return ("TASK", "[esc] back, [delete] delete task".to_string());
         }
 
         if self.expanded_list_id.is_some() {
             let c_text = if self.main_sort_mode == TaskSortMode::TimeLeft {
-                "c reverse"
+                "[c] reverse"
             } else {
-                "c hide/show done"
+                "[c] hide/show done"
             };
             return (
                 "LIST+",
                 format!(
-                    "esc back, j/k move, enter task, a done, d delete task, n new, t name, p prio, q color, x sort, {}",
+                    "[esc] back, [enter] task, [a] done, [d] delete task, [n] new, [t] name, [p] prio, [q] color, [x] sort, {}",
                     c_text
                 ),
             );
@@ -314,73 +409,62 @@ impl App {
 
         match self.page {
             Page::Main => {
-                let c_text = if self.main_sort_mode == TaskSortMode::TimeLeft {
-                    "c reverse"
-                } else {
-                    "c hide/show done"
+                let c_text = match self.main_sort_mode {
+                    TaskSortMode::DueDate => {
+                        if self.show_completed_in_due_mode {
+                            "hide completed"
+                        } else {
+                            "show completed"
+                        }
+                    }
+                    TaskSortMode::TimeLeft => {
+                        if self.time_left_reversed {
+                            "asc."
+                        } else {
+                            "desc."
+                        }
+                    }
                 };
-
-                if self.search_active {
-                    (
-                        "MAIN",
-                        format!(
-                            "type search, enter finish, esc clear, j/k move, enter open, a done, d delete, n notes, x sort, {}, u lists, q quit",
-                            c_text
-                        ),
-                    )
-                } else {
-                    (
-                        "MAIN",
-                        format!(
-                            "/ search, esc clear, j/k move, enter open, a done, d delete, n notes, x sort, {}, u lists, q quit",
-                            c_text
-                        ),
-                    )
-                }
+                let x_text = match self.main_sort_mode {
+                    TaskSortMode::DueDate => "sort by time remaining",
+                    TaskSortMode::TimeLeft => "sort by due date",
+                };
+                (
+                    "MAIN",
+                    format!(
+                        "[c] {}, [x] {}, [⬇/⬆(j/k)] navigate, [q] quit app",
+                        c_text, x_text
+                    ),
+                )
             }
             Page::TaskLists => (
                 "LISTS",
-                if self.list_search_active {
-                    "type search, enter finish, esc clear, j/k move, enter expand, n new list, d delete list, x sort, c reverse, u main, q quit".to_string()
+                if self.list_sort_reversed {
+                    format!(
+                        "[c] asc., [x] {}, [⬇/⬆(j/k)] navigate, [q] quit app",
+                        match self.list_sort_mode {
+                            ListSortMode::RemainingCount => "sort by priority",
+                            ListSortMode::Priority => "sort by remaining tasks",
+                        }
+                    )
                 } else {
-                    "/ search, j/k move, enter expand, n new list, d delete list, x sort, c reverse, u main, q quit".to_string()
-                },
+                    format!(
+                        "[c] desc., [x] {}, [⬇/⬆(j/k)] navigate, [q] quit app",
+                        match self.list_sort_mode {
+                            ListSortMode::RemainingCount => "sort by priority",
+                            ListSortMode::Priority => "sort by remaining tasks",
+                        }
+                    )
+                }
             ),
         }
     }
 
     fn draw_main_page(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(area);
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(82), Constraint::Percentage(18)])
-            .split(chunks[1]);
-
-        let search_line = if self.search.is_empty() {
-            Line::from(vec![
-                Span::styled("/", Style::default().fg(Color::DarkGray)),
-                Span::styled(" search", Style::default().fg(Color::DarkGray)),
-            ])
-        } else {
-            Line::from(Span::raw(self.search.clone()))
-        };
-
-        let search_title = "Search";
-
-        frame.render_widget(
-            Paragraph::new(vec![search_line])
-                .block(Block::default().borders(Borders::ALL).title(search_title)),
-            chunks[0],
-        );
-
-        if self.search_active && self.cursor_visible() {
-            let cursor =
-                self.cursor_position_for_input(chunks[0], &self.search, self.search_cursor_index);
-            frame.set_cursor_position(cursor);
-        }
+            .split(area);
 
         let items = self.data.main_task_items(
             &self.search,
@@ -393,20 +477,10 @@ impl App {
             self.build_task_rows(&items, self.main_sort_mode, &self.search, true);
 
         let title = match self.main_sort_mode {
-            TaskSortMode::DueDate => {
-                if self.show_completed_in_due_mode {
-                    "Due Date - (showing completed)"
-                } else {
-                    "Due Date - (completed hidden)"
-                }
-            }
-            TaskSortMode::TimeLeft => {
-                if self.time_left_reversed {
-                    "Time Remaining - (asc.)"
-                } else {
-                    "Time Remaining - (desc.)"
-                }
-            }
+            TaskSortMode::DueDate =>
+                "Tasks (due date) -- [a] mark completed, [del/bckspc] delete task, [n] new task, [enter] open/edit task",
+            TaskSortMode::TimeLeft =>
+                "Tasks (time remaining) -- [a] mark completed, [del/bckspc] delete task, [n] new task, [enter] open/edit task",
         };
 
         let mut state = ListState::default();
@@ -421,35 +495,11 @@ impl App {
     }
 
     fn draw_task_list_page(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(area);
         let items = self.filtered_task_list_items();
-
-        let search_line = if self.list_search.is_empty() {
-            Line::from(vec![
-                Span::styled("/", Style::default().fg(Color::DarkGray)),
-                Span::styled(" search lists", Style::default().fg(Color::DarkGray)),
-            ])
-        } else {
-            Line::from(Span::raw(self.list_search.clone()))
-        };
-        let search_title = "Search";
-        frame.render_widget(
-            Paragraph::new(vec![search_line])
-                .block(Block::default().borders(Borders::ALL).title(search_title)),
-            chunks[0],
-        );
-
-        if self.list_search_active && self.cursor_visible() {
-            let cursor = self.cursor_position_for_input(
-                chunks[0],
-                &self.list_search,
-                self.list_search_cursor_index,
-            );
-            frame.set_cursor_position(cursor);
-        }
+        let content_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(82), Constraint::Percentage(18)])
+            .split(area);
 
         let rows: Vec<ListItem> = if items.is_empty() {
             vec![ListItem::new("No task lists available")]
@@ -484,15 +534,104 @@ impl App {
             "(desc.)"
         };
         let title = match self.list_sort_mode {
-            ListSortMode::RemainingCount => format!("Lists * Pending Tasks - {}", order),
-            ListSortMode::Priority => format!("Lists * Priority - {}", order),
+            ListSortMode::RemainingCount => format!(
+                "Task Lists (remaining tasks {}) -- [del/bckspc] delete task list, [n] new task list, [enter] open/edit list",
+                order
+            ),
+            ListSortMode::Priority => format!(
+                "Task Lists (priority {}) -- [del/bckspc] delete task list, [n] new task list, [enter] open/edit list",
+                order
+            ),
         };
 
         let list = List::new(rows)
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-        frame.render_stateful_widget(list, chunks[1], &mut state);
+        frame.render_stateful_widget(list, content_chunks[0], &mut state);
+        self.draw_task_list_side_panel(frame, content_chunks[1], &items);
+    }
+
+    fn draw_multi_task_edit(&self, frame: &mut Frame) {
+        let Some(state) = &self.multi_task_edit else {
+            return;
+        };
+
+        let area = centered_rect(60, 40, frame.area());
+        frame.render_widget(Clear, area);
+
+        let mut selected_task_lines =
+            vec![Line::from(format!("Selected tasks: {}", state.keys.len()))];
+        for key in &state.keys {
+            if let Some(task) = self.data.get_task(*key) {
+                let list_color = self
+                    .data
+                    .get_list(key.list_id)
+                    .map(|list| color_from_hex(&list.color_hex))
+                    .unwrap_or(Color::White);
+                selected_task_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} | ", task.due_date),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(empty_if_blank(&task.title), Style::default().fg(list_color)),
+                ]));
+            }
+        }
+
+        let mut lines = match state.mode {
+            MultiTaskEditMode::Menu => vec![],
+            MultiTaskEditMode::DueDate => vec![
+                Line::from("Set due date for all selected tasks:"),
+                Line::from(state.input.clone()),
+                Line::from(""),
+            ],
+            MultiTaskEditMode::ListName => {
+                let mut lines = vec![
+                    Line::from("Move all selected tasks to list:"),
+                    Line::from(state.input.clone()),
+                    Line::from(""),
+                    Line::from("Suggestions:"),
+                ];
+                for (idx, suggestion) in self
+                    .data
+                    .list_name_suggestions(&state.input)
+                    .iter()
+                    .enumerate()
+                    .take(5)
+                {
+                    let style = if idx == state.suggestion_index {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    lines.push(Line::from(Span::styled(suggestion.clone(), style)));
+                }
+                lines
+            }
+        };
+        lines.extend(selected_task_lines);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Multi-Task Edit");
+        frame.render_widget(
+            Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+            area,
+        );
+
+        if self.cursor_visible()
+            && matches!(
+                state.mode,
+                MultiTaskEditMode::DueDate | MultiTaskEditMode::ListName
+            )
+        {
+            let cursor = self.cursor_position_for_input(area, &state.input, state.cursor_index);
+            frame.set_cursor_position(cursor);
+        }
     }
 
     fn draw_task_expanded(&self, frame: &mut Frame, task_key: TaskKey) {
@@ -580,25 +719,30 @@ impl App {
         };
 
         let lines = vec![
-            line_with_label("Title", &empty_if_blank(&task.title), Color::LightBlue),
+            line_with_label("Title [t]", &empty_if_blank(&task.title), Color::LightBlue),
+            line_with_label("Task List [l]", &list_name, list_color),
             line_with_label(
-                "Description",
-                &empty_if_blank(&task.description),
-                Color::LightBlue,
-            ),
-            line_with_label("Task List", &list_name, list_color),
-            line_with_label(
-                "Estimated",
+                "Estimated [e]",
                 &format!("{} hours", task.estimated_minutes),
                 Color::LightBlue,
             ),
             line_with_label(
-                "Actual",
+                "Actual [w]",
                 &format!("{} hours", task.actual_minutes),
                 Color::LightBlue,
             ),
-            line_with_label("Due Date", &format!("{}", task.due_date), Color::LightBlue),
-            line_with_label("Completed", &completion, Color::LightBlue),
+            line_with_label(
+                "Due Date [r]",
+                &format!("{}", task.due_date),
+                Color::LightBlue,
+            ),
+            line_with_label("Completed [a]", &completion, Color::LightBlue),
+            Line::from(""),
+            line_with_multiline_label(
+                "Description [d]",
+                &empty_if_blank(&task.description),
+                Color::LightBlue,
+            ),
         ];
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: true }),
@@ -734,7 +878,15 @@ impl App {
         state.select(selected_render_idx);
 
         let list_widget = List::new(rows)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title(
+                        Title::from("'⬇/⬆(j/k)' navigate, + 'shift' multiselect")
+                            .alignment(Alignment::Right),
+                    ),
+            )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
         frame.render_stateful_widget(list_widget, chunks[1], &mut state);
@@ -817,18 +969,17 @@ impl App {
         frame.render_widget(Clear, area);
 
         let lines = vec![
-            Line::from(Span::styled(
-                "Confirm Delete",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
             Line::from(confirm.message.clone()),
             Line::from(""),
             Line::from("Press Enter/Y to delete, Esc/N to cancel."),
         ];
 
         let popup = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Confirm"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Are you sure you want to delete? (this can't be undone)"),
+            )
             .wrap(Wrap { trim: true });
         frame.render_widget(popup, area);
     }
@@ -847,11 +998,13 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(idx, item)| {
+                    let completed = item.total_items.saturating_sub(item.remaining_items);
                     let row = format!(
-                        "{:>2}. {} | P{:>2}",
+                        "{:>2}. {} | {}/{}",
                         idx + 1,
                         fit_column(&item.name, 16),
-                        item.priority
+                        completed,
+                        item.total_items
                     );
                     ListItem::new(Line::from(Span::styled(
                         row,
@@ -862,7 +1015,7 @@ impl App {
         };
 
         let panel =
-            List::new(rows).block(Block::default().borders(Borders::ALL).title("Task Lists"));
+            List::new(rows).block(Block::default().borders(Borders::ALL).title("Task Lists - [u]"));
         frame.render_widget(panel, panels[0]);
 
         let notes_content = if self.notes_text.trim().is_empty() {
@@ -871,67 +1024,57 @@ impl App {
             self.notes_text.clone()
         };
         let notes = Paragraph::new(notes_content)
-            .block(Block::default().borders(Borders::ALL).title("Notes"))
+            .block(Block::default().borders(Borders::ALL).title("Notes - [o]"))
             .wrap(Wrap { trim: false });
         frame.render_widget(notes, panels[1]);
     }
 
-    fn draw_text_editor(&self, frame: &mut Frame) {
-        let Some(editor) = &self.text_editor else {
-            return;
-        };
-
-        let area = centered_rect(92, 88, frame.area());
-        frame.render_widget(Clear, area);
-
-        let title = match editor.target {
-            TextEditorTarget::Notes => "Notes Editor",
-            TextEditorTarget::TaskDescription(_) => "Description Editor",
-        };
-        let mode = if editor.command_active {
-            "COMMAND"
-        } else if editor.mode == TextEditorMode::Insert {
-            "INSERT"
-        } else {
-            "NORMAL"
-        };
-
-        let outer = Block::default()
-            .borders(Borders::ALL)
-            .title(format!("{} [{}]", title, mode));
-        let inner = outer.inner(area);
-        frame.render_widget(outer, area);
-
-        let chunks = Layout::default()
+    fn draw_task_list_side_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        items: &[life_tracking::TaskListViewItem],
+    ) {
+        let panels = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
-            .split(inner);
+            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(area);
 
-        let text = Paragraph::new(editor.content.clone()).wrap(Wrap { trim: false });
-        frame.render_widget(text, chunks[0]);
-
-        let command_text = if editor.command_active {
-            format!(":{}", editor.command)
-        } else if editor.mode == TextEditorMode::Insert {
-            "-- INSERT --".to_string()
+        let task_rows: Vec<ListItem> = if let Some(item) = items.get(self.selected_list_idx) {
+            if let Some(list) = self.data.get_list(item.list_id) {
+                let completed = list.tasks.iter().filter(|task| task.completed).count();
+                let mut rows = vec![ListItem::new(format!("{}/{} completed", completed, list.tasks.len()))];
+                if list.tasks.is_empty() {
+                    rows.push(ListItem::new("No tasks in list"));
+                } else {
+                    rows.extend(list.tasks.iter().map(|task| {
+                        ListItem::new(Line::from(Span::styled(
+                            empty_if_blank(&task.title),
+                            Style::default().fg(color_from_hex(&list.color_hex)),
+                        )))
+                    }));
+                }
+                rows
+            } else {
+                vec![ListItem::new("No list selected")]
+            }
         } else {
-            "-- NORMAL --".to_string()
+            vec![ListItem::new("No list selected")]
         };
-        frame.render_widget(
-            Paragraph::new(command_text).block(Block::default().borders(Borders::ALL).title("Cmd")),
-            chunks[1],
-        );
 
-        if self.cursor_visible() {
-            let (line, col) = cursor_line_col(&editor.content, editor.cursor_index);
-            let x = chunks[0]
-                .x
-                .saturating_add((col as u16).min(chunks[0].width.saturating_sub(1)));
-            let y = chunks[0]
-                .y
-                .saturating_add((line as u16).min(chunks[0].height.saturating_sub(1)));
-            frame.set_cursor_position((x, y));
-        }
+        let tasks_panel =
+            List::new(task_rows).block(Block::default().borders(Borders::ALL).title("Tasks - [u]"));
+        frame.render_widget(tasks_panel, panels[0]);
+
+        let notes_content = if self.notes_text.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            self.notes_text.clone()
+        };
+        let notes = Paragraph::new(notes_content)
+            .block(Block::default().borders(Borders::ALL).title("Notes - [o]"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(notes, panels[1]);
     }
 
     fn build_task_rows(
@@ -942,6 +1085,9 @@ impl App {
         show_description_match_preview: bool,
     ) -> (Vec<ListItem<'static>>, Option<usize>) {
         if items.is_empty() {
+            if sort_mode == TaskSortMode::DueDate {
+                return (vec![due_date_header_item(AppData::today())], None);
+            }
             return (vec![ListItem::new("No matching tasks")], None);
         }
 
@@ -955,22 +1101,34 @@ impl App {
         let mut rows = Vec::new();
         let mut task_to_render_idx = Vec::with_capacity(items.len());
         let mut previous_due = None;
+        let today = AppData::today();
+        let mut inserted_today_header = false;
 
         for item in items {
+            if sort_mode == TaskSortMode::DueDate
+                && !inserted_today_header
+                && previous_due.map(|due| due < today).unwrap_or(true)
+                && item.due_date > today
+            {
+                rows.push(due_date_header_item(today));
+                inserted_today_header = true;
+            }
+
             if sort_mode == TaskSortMode::DueDate && previous_due != Some(item.due_date) {
-                rows.push(ListItem::new(Line::from(Span::styled(
-                    format!("{}", item.due_date),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))));
+                rows.push(due_date_header_item(item.due_date));
                 previous_due = Some(item.due_date);
+                if item.due_date == today {
+                    inserted_today_header = true;
+                }
             }
 
             let completed_marker = if item.completed { "[x]" } else { "[ ]" };
             let title = empty_if_blank(&item.title);
             let list_color = color_from_hex(&item.list_color_hex);
-            let base_style = Style::default().fg(list_color);
+            let mut base_style = Style::default().fg(list_color);
+            if self.multi_selected_tasks.contains(&item.key) {
+                base_style = base_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+            }
 
             let mut spans = vec![Span::styled(
                 format!(
@@ -1010,13 +1168,17 @@ impl App {
             task_to_render_idx.push(rows.len() - 1);
         }
 
+        if sort_mode == TaskSortMode::DueDate && !inserted_today_header {
+            rows.push(due_date_header_item(today));
+        }
+
         let selected_render_idx = task_to_render_idx.get(selected_task_idx).copied();
         (rows, selected_render_idx)
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.text_editor.is_some() {
-            self.handle_text_editor_key(key);
+        if self.multi_task_edit.is_some() {
+            self.handle_multi_task_edit_key(key);
             return;
         }
 
@@ -1069,12 +1231,18 @@ impl App {
                 self.search.clear();
                 self.search_cursor_index = 0;
                 self.selected_main_idx = 0;
+                self.clear_multi_selection();
             }
-            KeyCode::Char('u') => self.page = Page::TaskLists,
-            KeyCode::Char('n') => self.open_notes_editor(),
+            KeyCode::Char('u') => {
+                self.clear_multi_selection();
+                self.page = Page::TaskLists;
+            }
+            KeyCode::Char('n') => self.create_task_from_main(),
+            KeyCode::Char('o') => self.open_notes_editor(),
             KeyCode::Char('x') => {
                 self.main_sort_mode = toggle_task_sort_mode(self.main_sort_mode);
                 self.selected_main_idx = 0;
+                self.clear_multi_selection();
             }
             KeyCode::Char('c') => {
                 if self.main_sort_mode == TaskSortMode::TimeLeft {
@@ -1083,42 +1251,51 @@ impl App {
                     self.show_completed_in_due_mode = !self.show_completed_in_due_mode;
                 }
                 self.selected_main_idx = 0;
+                self.clear_multi_selection();
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_main_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_main_selection(-1),
+            KeyCode::Down => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.extend_task_selection(1);
+                } else {
+                    self.move_main_selection(1);
+                }
+            }
+            KeyCode::Up => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.extend_task_selection(-1);
+                } else {
+                    self.move_main_selection(-1);
+                }
+            }
+            KeyCode::Char('J') => self.extend_task_selection(1),
+            KeyCode::Char('K') => self.extend_task_selection(-1),
+            KeyCode::Char('j') => self.move_main_selection(1),
+            KeyCode::Char('k') => self.move_main_selection(-1),
             KeyCode::Enter => {
-                let items = self.data.main_task_items(
-                    &self.search,
-                    self.main_sort_mode,
-                    self.time_left_reversed,
-                    self.show_completed_in_due_mode,
-                );
-                if let Some(item) = items.get(self.selected_main_idx) {
-                    self.expanded_task_key = Some(item.key);
+                if self.multi_selected_tasks.len() > 1 {
+                    self.open_multi_task_edit();
+                } else {
+                    let items = self.current_task_items();
+                    if let Some(item) = items.get(self.selected_main_idx) {
+                        self.clear_multi_selection();
+                        self.expanded_task_key = Some(item.key);
+                    }
                 }
             }
             KeyCode::Char('a') => {
-                let items = self.data.main_task_items(
-                    &self.search,
-                    self.main_sort_mode,
-                    self.time_left_reversed,
-                    self.show_completed_in_due_mode,
-                );
+                let items = self.current_task_items();
                 if let Some(item) = items.get(self.selected_main_idx) {
                     let today = AppData::today();
                     let result = self.data.toggle_task_completed(item.key, today);
                     self.run_io(result);
+                    self.clear_multi_selection();
                     self.normalize_main_selection();
                 }
             }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                let items = self.data.main_task_items(
-                    &self.search,
-                    self.main_sort_mode,
-                    self.time_left_reversed,
-                    self.show_completed_in_due_mode,
-                );
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                let items = self.current_task_items();
                 if let Some(item) = items.get(self.selected_main_idx) {
+                    self.clear_multi_selection();
                     self.confirm = Some(ConfirmState {
                         message: format!("Delete task '{}'?", empty_if_blank(&item.title)),
                         action: ConfirmAction::DeleteTask(item.key),
@@ -1137,11 +1314,15 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Char('u') => self.page = Page::Main,
+            KeyCode::Char('u') => {
+                self.clear_multi_selection();
+                self.page = Page::Main;
+            }
             KeyCode::Char('/') => {
                 self.list_search_active = true;
                 self.list_search_cursor_index = self.list_search.chars().count();
             }
+            KeyCode::Char('o') => self.open_notes_editor(),
             KeyCode::Char('x') => {
                 self.list_sort_mode = toggle_list_sort_mode(self.list_sort_mode);
                 self.selected_list_idx = 0;
@@ -1155,6 +1336,7 @@ impl App {
             KeyCode::Enter => {
                 let items = self.filtered_task_list_items();
                 if let Some(item) = items.get(self.selected_list_idx) {
+                    self.clear_multi_selection();
                     self.expanded_list_id = Some(item.list_id);
                     self.selected_list_task_idx = 0;
                 }
@@ -1173,7 +1355,7 @@ impl App {
                     Err(err) => self.push_popup(format!("failed to create task list: {}", err)),
                 }
             }
-            KeyCode::Char('d') | KeyCode::Delete => {
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
                 let items = self.filtered_task_list_items();
                 if let Some(item) = items.get(self.selected_list_idx) {
                     self.confirm = Some(ConfirmState {
@@ -1244,6 +1426,7 @@ impl App {
             KeyCode::Char('x') => {
                 self.main_sort_mode = toggle_task_sort_mode(self.main_sort_mode);
                 self.selected_list_task_idx = 0;
+                self.clear_multi_selection();
             }
             KeyCode::Char('c') => {
                 if self.main_sort_mode == TaskSortMode::TimeLeft {
@@ -1252,45 +1435,51 @@ impl App {
                     self.show_completed_in_due_mode = !self.show_completed_in_due_mode;
                 }
                 self.selected_list_task_idx = 0;
+                self.clear_multi_selection();
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_list_task_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_list_task_selection(-1),
+            KeyCode::Down => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.extend_task_selection(1);
+                } else {
+                    self.move_list_task_selection(1);
+                }
+            }
+            KeyCode::Up => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.extend_task_selection(-1);
+                } else {
+                    self.move_list_task_selection(-1);
+                }
+            }
+            KeyCode::Char('J') => self.extend_task_selection(1),
+            KeyCode::Char('K') => self.extend_task_selection(-1),
+            KeyCode::Char('j') => self.move_list_task_selection(1),
+            KeyCode::Char('k') => self.move_list_task_selection(-1),
             KeyCode::Enter => {
-                let items = self.data.list_task_items(
-                    list_id,
-                    "",
-                    self.main_sort_mode,
-                    self.time_left_reversed,
-                    self.show_completed_in_due_mode,
-                );
-                if let Some(item) = items.get(self.selected_list_task_idx) {
-                    self.expanded_task_key = Some(item.key);
+                if self.multi_selected_tasks.len() > 1 {
+                    self.open_multi_task_edit();
+                } else {
+                    let items = self.current_task_items();
+                    if let Some(item) = items.get(self.selected_list_task_idx) {
+                        self.clear_multi_selection();
+                        self.expanded_task_key = Some(item.key);
+                    }
                 }
             }
             KeyCode::Char('a') => {
-                let items = self.data.list_task_items(
-                    list_id,
-                    "",
-                    self.main_sort_mode,
-                    self.time_left_reversed,
-                    self.show_completed_in_due_mode,
-                );
+                let items = self.current_task_items();
                 if let Some(item) = items.get(self.selected_list_task_idx) {
                     let today = AppData::today();
                     let result = self.data.toggle_task_completed(item.key, today);
                     self.run_io(result);
+                    self.clear_multi_selection();
                     self.normalize_list_task_selection();
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => {
-                let items = self.data.list_task_items(
-                    list_id,
-                    "",
-                    self.main_sort_mode,
-                    self.time_left_reversed,
-                    self.show_completed_in_due_mode,
-                );
+                let items = self.current_task_items();
                 if let Some(item) = items.get(self.selected_list_task_idx) {
+                    self.clear_multi_selection();
                     self.confirm = Some(ConfirmState {
                         message: format!("Delete task '{}'?", empty_if_blank(&item.title)),
                         action: ConfirmAction::DeleteTask(item.key),
@@ -1302,6 +1491,7 @@ impl App {
                 let created = self.data.create_task_in_list(list_id, today);
                 match created {
                     Ok(Some(key)) => {
+                        self.clear_multi_selection();
                         self.expanded_task_key = Some(key);
                         self.selected_list_task_idx = 0;
                     }
@@ -1366,147 +1556,100 @@ impl App {
         }
     }
 
-    fn handle_text_editor_key(&mut self, key: KeyEvent) {
-        let Some(editor) = &mut self.text_editor else {
+    fn handle_multi_task_edit_key(&mut self, key: KeyEvent) {
+        let Some(state) = &mut self.multi_task_edit else {
             return;
         };
 
-        if editor.command_active {
-            match key.code {
-                KeyCode::Esc => {
-                    editor.command_active = false;
-                    editor.command.clear();
+        match state.mode {
+            MultiTaskEditMode::Menu => match key.code {
+                KeyCode::Esc => self.multi_task_edit = None,
+                KeyCode::Char('r') => {
+                    state.mode = MultiTaskEditMode::DueDate;
+                    state.input.clear();
+                    state.cursor_index = 0;
                 }
-                KeyCode::Enter => {
-                    let command = editor.command.trim().to_string();
-                    editor.command_active = false;
-                    editor.command.clear();
-                    self.execute_text_editor_command(&command);
+                KeyCode::Char('l') => {
+                    state.mode = MultiTaskEditMode::ListName;
+                    state.input.clear();
+                    state.cursor_index = 0;
+                    state.suggestion_index = 0;
                 }
-                KeyCode::Backspace => {
-                    editor.command.pop();
-                }
-                KeyCode::Char(c) => {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        editor.command.push(c);
-                    }
-                }
+                KeyCode::Char('d') => self.request_multi_task_delete(),
                 _ => {}
-            }
-            return;
-        }
-
-        if editor.mode == TextEditorMode::Insert {
-            match key.code {
-                KeyCode::Esc => editor.mode = TextEditorMode::Normal,
-                KeyCode::Enter => {
-                    insert_char_at_cursor(&mut editor.content, &mut editor.cursor_index, '\n')
-                }
+            },
+            MultiTaskEditMode::DueDate => match key.code {
+                KeyCode::Esc => state.mode = MultiTaskEditMode::Menu,
+                KeyCode::Enter => self.commit_multi_task_due_date(),
                 KeyCode::Backspace => {
-                    if editor.cursor_index > 0 {
-                        remove_char_before_cursor(&mut editor.content, &mut editor.cursor_index);
+                    if state.cursor_index > 0 {
+                        remove_char_before_cursor(&mut state.input, &mut state.cursor_index);
                     }
                 }
-                KeyCode::Delete => remove_char_at_cursor(&mut editor.content, editor.cursor_index),
-                KeyCode::Left => editor.cursor_index = editor.cursor_index.saturating_sub(1),
+                KeyCode::Delete => remove_char_at_cursor(&mut state.input, state.cursor_index),
+                KeyCode::Left => state.cursor_index = state.cursor_index.saturating_sub(1),
                 KeyCode::Right => {
-                    editor.cursor_index =
-                        (editor.cursor_index + 1).min(editor.content.chars().count())
+                    state.cursor_index = (state.cursor_index + 1).min(state.input.chars().count())
                 }
-                KeyCode::Up => move_cursor_vertical(&editor.content, &mut editor.cursor_index, -1),
-                KeyCode::Down => move_cursor_vertical(&editor.content, &mut editor.cursor_index, 1),
-                KeyCode::Home => {
-                    let (line, _) = cursor_line_col(&editor.content, editor.cursor_index);
-                    editor.cursor_index = index_for_line_col(&editor.content, line, 0);
-                }
-                KeyCode::End => {
-                    let (line, _) = cursor_line_col(&editor.content, editor.cursor_index);
-                    let line_len = line_length(&editor.content, line);
-                    editor.cursor_index = index_for_line_col(&editor.content, line, line_len);
-                }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.save_text_editor(false);
-                }
-                KeyCode::Char(c) => {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        insert_char_at_cursor(&mut editor.content, &mut editor.cursor_index, c);
-                    }
+                KeyCode::Home => state.cursor_index = 0,
+                KeyCode::End => state.cursor_index = state.input.chars().count(),
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
+                    insert_char_at_cursor(&mut state.input, &mut state.cursor_index, c);
                 }
                 _ => {}
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Char('i') => editor.mode = TextEditorMode::Insert,
-            KeyCode::Char('a') => {
-                editor.cursor_index = (editor.cursor_index + 1).min(editor.content.chars().count());
-                editor.mode = TextEditorMode::Insert;
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                editor.cursor_index = editor.cursor_index.saturating_sub(1)
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                editor.cursor_index = (editor.cursor_index + 1).min(editor.content.chars().count())
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                move_cursor_vertical(&editor.content, &mut editor.cursor_index, -1)
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                move_cursor_vertical(&editor.content, &mut editor.cursor_index, 1)
-            }
-            KeyCode::Char('0') | KeyCode::Home => {
-                let (line, _) = cursor_line_col(&editor.content, editor.cursor_index);
-                editor.cursor_index = index_for_line_col(&editor.content, line, 0);
-            }
-            KeyCode::Char('$') | KeyCode::End => {
-                let (line, _) = cursor_line_col(&editor.content, editor.cursor_index);
-                let line_len = line_length(&editor.content, line);
-                editor.cursor_index = index_for_line_col(&editor.content, line, line_len);
-            }
-            KeyCode::Char('x') => remove_char_at_cursor(&mut editor.content, editor.cursor_index),
-            KeyCode::Char('o') => {
-                let (line, _) = cursor_line_col(&editor.content, editor.cursor_index);
-                let line_len = line_length(&editor.content, line);
-                editor.cursor_index = index_for_line_col(&editor.content, line, line_len);
-                insert_char_at_cursor(&mut editor.content, &mut editor.cursor_index, '\n');
-                editor.mode = TextEditorMode::Insert;
-            }
-            KeyCode::Char('O') => {
-                let (line, _) = cursor_line_col(&editor.content, editor.cursor_index);
-                editor.cursor_index = index_for_line_col(&editor.content, line, 0);
-                insert_char_at_cursor(&mut editor.content, &mut editor.cursor_index, '\n');
-                editor.cursor_index = editor.cursor_index.saturating_sub(1);
-                editor.mode = TextEditorMode::Insert;
-            }
-            KeyCode::Char(':') => {
-                editor.command_active = true;
-                editor.command.clear();
-            }
-            _ => {}
+            },
+            MultiTaskEditMode::ListName => match key.code {
+                KeyCode::Esc => state.mode = MultiTaskEditMode::Menu,
+                KeyCode::Enter => self.commit_multi_task_list_move(),
+                KeyCode::Up => {
+                    state.suggestion_index = state.suggestion_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let suggestions = self.data.list_name_suggestions(&state.input);
+                    if !suggestions.is_empty() {
+                        state.suggestion_index =
+                            (state.suggestion_index + 1).min(suggestions.len() - 1);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if state.cursor_index > 0 {
+                        remove_char_before_cursor(&mut state.input, &mut state.cursor_index);
+                    }
+                    state.suggestion_index = 0;
+                }
+                KeyCode::Delete => {
+                    remove_char_at_cursor(&mut state.input, state.cursor_index);
+                    state.suggestion_index = 0;
+                }
+                KeyCode::Left => state.cursor_index = state.cursor_index.saturating_sub(1),
+                KeyCode::Right => {
+                    state.cursor_index = (state.cursor_index + 1).min(state.input.chars().count())
+                }
+                KeyCode::Home => state.cursor_index = 0,
+                KeyCode::End => state.cursor_index = state.input.chars().count(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    insert_char_at_cursor(&mut state.input, &mut state.cursor_index, c);
+                    state.suggestion_index = 0;
+                }
+                _ => {}
+            },
         }
     }
 
-    fn execute_text_editor_command(&mut self, command: &str) {
-        match command {
-            "w" => self.save_text_editor(false),
-            "wq" => self.save_text_editor(true),
-            "q" => self.text_editor = None,
-            _ => self.push_popup(format!("unknown command: :{}", command)),
-        }
-    }
-
-    fn save_text_editor(&mut self, close_after: bool) {
-        let Some((target, content)) = self
-            .text_editor
-            .as_ref()
-            .map(|editor| (editor.target, editor.content.clone()))
-        else {
-            return;
-        };
-
-        match target {
-            TextEditorTarget::Notes => {
+    fn open_notes_editor(&mut self) {
+        let current_notes = self.notes_text.clone();
+        match self.edit_text_in_vim(
+            "notes",
+            &current_notes,
+            &[
+                "# Notes editor",
+                "#",
+                "# Edit freely, then save and quit with :wq",
+                "# Quit without saving with :q!",
+                "# Lines in this help block are ignored when saved",
+            ],
+        ) {
+            Ok(content) => {
                 let path = self.data.data_dir.join("notes.txt");
                 if let Err(err) = fs::write(&path, &content) {
                     self.push_popup(format!("failed to save notes: {}", err));
@@ -1514,42 +1657,118 @@ impl App {
                 }
                 self.notes_text = content;
             }
-            TextEditorTarget::TaskDescription(task_key) => {
-                let result = self
-                    .data
-                    .update_task_description(task_key, content, AppData::today());
-                self.run_io(result);
-            }
-        }
-
-        if close_after {
-            self.text_editor = None;
+            Err(err) => self.push_popup(format!("failed to open vim: {}", err)),
         }
     }
 
-    fn open_notes_editor(&mut self) {
-        self.text_editor = Some(TextEditorState {
-            target: TextEditorTarget::Notes,
-            content: self.notes_text.clone(),
-            cursor_index: self.notes_text.chars().count(),
-            mode: TextEditorMode::Normal,
-            command_active: false,
-            command: String::new(),
-        });
+    fn create_task_from_main(&mut self) {
+        let ranked_lists = self.data.task_list_items(ListSortMode::Priority);
+        let Some(default_list) = ranked_lists.first() else {
+            self.push_popup("no task list available for new task".to_string());
+            return;
+        };
+
+        let today = AppData::today();
+        match self.data.create_task_in_list(default_list.list_id, today) {
+            Ok(Some(key)) => {
+                self.clear_multi_selection();
+                self.normalize_main_selection();
+                self.expanded_task_key = Some(key);
+            }
+            Ok(None) => {}
+            Err(err) => self.push_popup(format!("failed to create task: {}", err)),
+        }
     }
 
     fn open_task_description_editor(&mut self, task_key: TaskKey) {
         let Some(task) = self.data.get_task(task_key) else {
             return;
         };
-        self.text_editor = Some(TextEditorState {
-            target: TextEditorTarget::TaskDescription(task_key),
-            content: task.description.clone(),
-            cursor_index: task.description.chars().count(),
-            mode: TextEditorMode::Normal,
-            command_active: false,
-            command: String::new(),
-        });
+        let current_description = task.description.clone();
+        match self.edit_text_in_vim(
+            "description",
+            &current_description,
+            &[
+                "# Task description editor",
+                "#",
+                "# Write any task details you want to keep",
+                "# Save and quit with :wq",
+                "# Quit without saving with :q!",
+                "# Lines in this help block are ignored when saved",
+            ],
+        ) {
+            Ok(content) => {
+                let result = self
+                    .data
+                    .update_task_description(task_key, content, AppData::today());
+                self.run_io(result);
+            }
+            Err(err) => self.push_popup(format!("failed to open vim: {}", err)),
+        }
+    }
+
+    fn edit_text_in_vim(
+        &mut self,
+        file_stem: &str,
+        initial_content: &str,
+        help_lines: &[&str],
+    ) -> io::Result<String> {
+        let temp_path = self.data.data_dir.join(format!(
+            ".life-tracking-{}-{}.tmp",
+            file_stem,
+            std::process::id()
+        ));
+        let mut temp_content = String::new();
+        temp_content.push_str(VIM_HELP_START);
+        temp_content.push('\n');
+        for line in help_lines {
+            temp_content.push_str(line);
+            temp_content.push('\n');
+        }
+        temp_content.push_str(VIM_HELP_END);
+        temp_content.push_str("\n\n");
+        temp_content.push_str(initial_content);
+        fs::write(&temp_path, temp_content)?;
+
+        let mut stdout = io::stdout();
+        disable_raw_mode()?;
+        execute!(stdout, Show, LeaveAlternateScreen)?;
+        stdout.flush()?;
+
+        let edit_result = (|| -> io::Result<String> {
+            let status = Command::new("vim")
+                .arg("-c")
+                .arg("setlocal filetype=gitcommit")
+                .arg(&temp_path)
+                .status()?;
+
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "vim exited with status {}",
+                    status
+                )));
+            }
+
+            fs::read_to_string(&temp_path).map(|content| strip_vim_help_block(&content))
+        })();
+
+        let restore_result = (|| -> io::Result<()> {
+            enable_raw_mode()?;
+            self.cursor_blink_start = Instant::now();
+            self.pending_full_redraw = true;
+            execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                Hide,
+                TermClear(ClearType::All)
+            )?;
+            Ok(())
+        })();
+
+        let _ = fs::remove_file(&temp_path);
+
+        restore_result?;
+        edit_result
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
@@ -1815,6 +2034,7 @@ impl App {
     }
 
     fn move_main_selection(&mut self, delta: isize) {
+        self.clear_multi_selection();
         let items = self.data.main_task_items(
             &self.search,
             self.main_sort_mode,
@@ -1825,11 +2045,13 @@ impl App {
     }
 
     fn move_list_selection(&mut self, delta: isize) {
+        self.clear_multi_selection();
         let items = self.filtered_task_list_items();
         self.selected_list_idx = shift_index(self.selected_list_idx, items.len(), delta);
     }
 
     fn move_list_task_selection(&mut self, delta: isize) {
+        self.clear_multi_selection();
         let Some(list_id) = self.expanded_list_id else {
             return;
         };
@@ -1888,7 +2110,7 @@ impl App {
     }
 
     fn apply_confirmed_action(&mut self) {
-        let Some(action) = self.confirm.as_ref().map(|confirm| confirm.action) else {
+        let Some(action) = self.confirm.as_ref().map(|confirm| confirm.action.clone()) else {
             return;
         };
 
@@ -1902,6 +2124,14 @@ impl App {
                     self.expanded_task_key = None;
                 }
 
+                self.normalize_main_selection();
+                self.normalize_list_task_selection();
+            }
+            ConfirmAction::DeleteTasks(keys) => {
+                let result = self.data.delete_tasks(&keys, today);
+                self.run_io(result);
+
+                self.clear_multi_selection();
                 self.normalize_main_selection();
                 self.normalize_list_task_selection();
             }
@@ -1925,6 +2155,143 @@ impl App {
                 self.normalize_main_selection();
             }
         }
+    }
+
+    fn current_task_items(&self) -> Vec<life_tracking::TaskViewItem> {
+        if let Some(list_id) = self.expanded_list_id {
+            self.data.list_task_items(
+                list_id,
+                "",
+                self.main_sort_mode,
+                self.time_left_reversed,
+                self.show_completed_in_due_mode,
+            )
+        } else {
+            self.data.main_task_items(
+                &self.search,
+                self.main_sort_mode,
+                self.time_left_reversed,
+                self.show_completed_in_due_mode,
+            )
+        }
+    }
+
+    fn current_task_selection_index(&self) -> usize {
+        if self.expanded_list_id.is_some() {
+            self.selected_list_task_idx
+        } else {
+            self.selected_main_idx
+        }
+    }
+
+    fn set_current_task_selection_index(&mut self, value: usize) {
+        if self.expanded_list_id.is_some() {
+            self.selected_list_task_idx = value;
+        } else {
+            self.selected_main_idx = value;
+        }
+    }
+
+    fn clear_multi_selection(&mut self) {
+        self.task_selection_anchor = None;
+        self.multi_selected_tasks.clear();
+        self.multi_task_edit = None;
+    }
+
+    fn extend_task_selection(&mut self, delta: isize) {
+        let items = self.current_task_items();
+        if items.is_empty() {
+            self.clear_multi_selection();
+            return;
+        }
+
+        let current = self.current_task_selection_index().min(items.len() - 1);
+        let next = shift_index(current, items.len(), delta);
+        let anchor = self.task_selection_anchor.unwrap_or(current);
+        let start = anchor.min(next);
+        let end = anchor.max(next);
+
+        self.task_selection_anchor = Some(anchor);
+        self.set_current_task_selection_index(next);
+        self.multi_selected_tasks = items[start..=end].iter().map(|item| item.key).collect();
+    }
+
+    fn open_multi_task_edit(&mut self) {
+        let items = self.current_task_items();
+        let keys: Vec<TaskKey> = items
+            .iter()
+            .filter(|item| self.multi_selected_tasks.contains(&item.key))
+            .map(|item| item.key)
+            .collect();
+
+        if keys.len() < 2 {
+            return;
+        }
+
+        self.multi_task_edit = Some(MultiTaskEditState {
+            keys,
+            mode: MultiTaskEditMode::Menu,
+            input: String::new(),
+            cursor_index: 0,
+            suggestion_index: 0,
+        });
+    }
+
+    fn commit_multi_task_due_date(&mut self) {
+        let Some(state) = self.multi_task_edit.as_ref() else {
+            return;
+        };
+        let input = state.input.trim().to_string();
+        let keys = state.keys.clone();
+
+        match NaiveDate::parse_from_str(&input, "%Y-%m-%d") {
+            Ok(date) => {
+                let result = self
+                    .data
+                    .update_tasks_due_date(&keys, date, AppData::today());
+                self.run_io(result);
+                self.clear_multi_selection();
+                self.normalize_main_selection();
+                self.normalize_list_task_selection();
+            }
+            Err(_) => self.push_popup("invalid due date format; use YYYY-MM-DD".to_string()),
+        }
+    }
+
+    fn commit_multi_task_list_move(&mut self) {
+        let Some(state) = self.multi_task_edit.as_ref() else {
+            return;
+        };
+
+        let suggestions = self.data.list_name_suggestions(&state.input);
+        let selected_name = suggestions
+            .get(state.suggestion_index)
+            .cloned()
+            .unwrap_or_else(|| state.input.trim().to_string());
+        let keys = state.keys.clone();
+
+        if let Some(list_id) = self.data.find_list_id_by_name(&selected_name) {
+            let result = self
+                .data
+                .move_tasks_to_list(&keys, list_id, AppData::today());
+            self.run_io(result);
+            self.clear_multi_selection();
+            self.normalize_main_selection();
+            self.normalize_list_task_selection();
+        }
+    }
+
+    fn request_multi_task_delete(&mut self) {
+        let Some(state) = self.multi_task_edit.as_ref() else {
+            return;
+        };
+
+        let keys = state.keys.clone();
+        self.multi_task_edit = None;
+        self.confirm = Some(ConfirmState {
+            message: format!("Delete {} selected tasks?", keys.len()),
+            action: ConfirmAction::DeleteTasks(keys),
+        });
     }
 
     fn normalize_list_selection(&mut self) {
@@ -2009,65 +2376,6 @@ fn remove_char_at_cursor(value: &mut String, cursor_index: usize) {
     if start < end {
         value.replace_range(start..end, "");
     }
-}
-
-fn cursor_line_col(text: &str, cursor_index: usize) -> (usize, usize) {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut remaining = cursor_index.min(text.chars().count());
-
-    for (line_idx, line) in lines.iter().enumerate() {
-        let len = line.chars().count();
-        if remaining <= len {
-            return (line_idx, remaining);
-        }
-        remaining = remaining.saturating_sub(len + 1);
-    }
-
-    let last_idx = lines.len().saturating_sub(1);
-    let last_len = lines
-        .get(last_idx)
-        .map(|line| line.chars().count())
-        .unwrap_or(0);
-    (last_idx, last_len)
-}
-
-fn index_for_line_col(text: &str, line: usize, col: usize) -> usize {
-    let lines: Vec<&str> = text.split('\n').collect();
-    if lines.is_empty() {
-        return 0;
-    }
-
-    let target_line = line.min(lines.len() - 1);
-    let mut index = 0usize;
-    for entry in lines.iter().take(target_line) {
-        index += entry.chars().count() + 1;
-    }
-    index + col.min(lines[target_line].chars().count())
-}
-
-fn line_length(text: &str, line: usize) -> usize {
-    let lines: Vec<&str> = text.split('\n').collect();
-    if lines.is_empty() {
-        return 0;
-    }
-    let target_line = line.min(lines.len() - 1);
-    lines[target_line].chars().count()
-}
-
-fn move_cursor_vertical(text: &str, cursor_index: &mut usize, delta: isize) {
-    let (line, col) = cursor_line_col(text, *cursor_index);
-    let lines: Vec<&str> = text.split('\n').collect();
-    if lines.is_empty() {
-        *cursor_index = 0;
-        return;
-    }
-
-    let next_line = if delta < 0 {
-        line.saturating_sub(delta.unsigned_abs())
-    } else {
-        (line + delta as usize).min(lines.len() - 1)
-    };
-    *cursor_index = index_for_line_col(text, next_line, col);
 }
 
 struct DescriptionMatchPreview {
@@ -2166,6 +2474,27 @@ fn fit_column(value: &str, width: usize) -> String {
     short
 }
 
+fn strip_vim_help_block(content: &str) -> String {
+    let mut result = Vec::new();
+    let mut skipping = false;
+
+    for line in content.lines() {
+        if line == VIM_HELP_START {
+            skipping = true;
+            continue;
+        }
+        if line == VIM_HELP_END {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            result.push(line);
+        }
+    }
+
+    result.join("\n").trim_start_matches('\n').to_string()
+}
+
 fn toggle_task_sort_mode(mode: TaskSortMode) -> TaskSortMode {
     match mode {
         TaskSortMode::DueDate => TaskSortMode::TimeLeft,
@@ -2224,10 +2553,47 @@ fn color_from_hex(hex: &str) -> Color {
         .unwrap_or(Color::White)
 }
 
+fn current_accent_color() -> Color {
+    Color::LightCyan
+}
+
+fn due_date_header_item(date: NaiveDate) -> ListItem<'static> {
+    let is_today = date == AppData::today();
+    let style = if is_today {
+        Style::default()
+            .fg(current_accent_color())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let label = if is_today {
+        format!("{} -- TODAY", date)
+    } else {
+        format!("{}", date)
+    };
+
+    ListItem::new(Line::from(Span::styled(label, style)))
+}
+
 fn line_with_label(label: &str, value: &str, label_color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{}: ", label),
+            Style::default()
+                .fg(label_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(value.to_string()),
+    ])
+}
+
+fn line_with_multiline_label(label: &str, value: &str, label_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{}:\n", label),
             Style::default()
                 .fg(label_color)
                 .add_modifier(Modifier::BOLD),

@@ -388,6 +388,28 @@ impl AppData {
         self.persist_after_edit(today)
     }
 
+    pub fn update_tasks_due_date(
+        &mut self,
+        keys: &[TaskKey],
+        due_date: NaiveDate,
+        today: NaiveDate,
+    ) -> io::Result<()> {
+        let mut updated = false;
+
+        for key in keys {
+            if let Some(task) = self.get_task_mut(*key) {
+                task.due_date = due_date;
+                updated = true;
+            }
+        }
+
+        if !updated {
+            return Ok(());
+        }
+
+        self.persist_after_edit(today)
+    }
+
     pub fn move_task_to_list(
         &mut self,
         key: TaskKey,
@@ -421,6 +443,51 @@ impl AppData {
         }
 
         self.lists[target_idx].tasks.push(task);
+        self.persist_after_edit(today)
+    }
+
+    pub fn move_tasks_to_list(
+        &mut self,
+        keys: &[TaskKey],
+        target_list_id: u64,
+        today: NaiveDate,
+    ) -> io::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let Some(target_idx) = self.lists.iter().position(|list| list.id == target_list_id) else {
+            return Ok(());
+        };
+
+        let key_set: HashSet<TaskKey> = keys.iter().copied().collect();
+        let mut moved_tasks = Vec::new();
+
+        for list in &mut self.lists {
+            if list.id == target_list_id {
+                continue;
+            }
+
+            let mut kept_tasks = Vec::with_capacity(list.tasks.len());
+            for task in list.tasks.drain(..) {
+                let key = TaskKey {
+                    list_id: list.id,
+                    task_id: task.id,
+                };
+                if key_set.contains(&key) {
+                    moved_tasks.push(task);
+                } else {
+                    kept_tasks.push(task);
+                }
+            }
+            list.tasks = kept_tasks;
+        }
+
+        if moved_tasks.is_empty() {
+            return Ok(());
+        }
+
+        self.lists[target_idx].tasks.extend(moved_tasks);
         self.persist_after_edit(today)
     }
 
@@ -476,6 +543,34 @@ impl AppData {
         let before = list.tasks.len();
         list.tasks.retain(|task| task.id != key.task_id);
         if list.tasks.len() == before {
+            return Ok(());
+        }
+
+        self.persist_after_edit(today)
+    }
+
+    pub fn delete_tasks(&mut self, keys: &[TaskKey], today: NaiveDate) -> io::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let key_set: HashSet<TaskKey> = keys.iter().copied().collect();
+        let mut deleted = false;
+
+        for list in &mut self.lists {
+            let before = list.tasks.len();
+            list.tasks.retain(|task| {
+                !key_set.contains(&TaskKey {
+                    list_id: list.id,
+                    task_id: task.id,
+                })
+            });
+            if list.tasks.len() != before {
+                deleted = true;
+            }
+        }
+
+        if !deleted {
             return Ok(());
         }
 
